@@ -617,9 +617,19 @@ UA_DataSetReader_process(UA_PubSubManager *psm, UA_DataSetReader *dsr,
      *     }
      * } */
 
-    if(msg->header.dataSetMessageType != UA_DATASETMESSAGE_DATAKEYFRAME) {
+    /* OTee: DeltaFrames are applied as well as KeyFrames.
+     *
+     * Part 14 §7.2.2.4.2 defines the DeltaFrame DataSetMessage as a standard
+     * message type carrying only the fields that changed, each preceded by its
+     * index in the full DataSet. The binary decoder here already produces them
+     * (UA_DataSetMessage_deltaFrame_decodeBinary); only this apply step was
+     * missing, so a Publisher configured with KeyFrameCount > 1 lost every
+     * update between key frames — quietly, since a dropped DataSetMessage is
+     * indistinguishable from a lost datagram. */
+    if(msg->header.dataSetMessageType != UA_DATASETMESSAGE_DATAKEYFRAME &&
+       msg->header.dataSetMessageType != UA_DATASETMESSAGE_DATADELTAFRAME) {
         UA_LOG_WARNING_PUBSUB(psm->logging, dsr,
-                              "DataSetMessage is discarded: Only keyframes are supported");
+                              "DataSetMessage is discarded: unsupported message type");
         return;
     }
 
@@ -642,9 +652,15 @@ UA_DataSetReader_process(UA_PubSubManager *psm, UA_DataSetReader *dsr,
     if(msg->fieldCount == 0)
         return;
 
-    /* Check whether the field count matches the configuration */
+    /* Check whether the field count matches the configuration.
+     *
+     * OTee: only a KeyFrame carries the whole DataSet, so only a KeyFrame's
+     * field count has to equal the TargetVariables count. A DeltaFrame carries
+     * a subset and addresses each field by index, which is bounds-checked
+     * below instead. */
     UA_TargetVariablesDataType *tvs = &dsr->config.subscribedDataSet.target;
-    if(tvs->targetVariablesSize != msg->fieldCount) {
+    if(msg->header.dataSetMessageType == UA_DATASETMESSAGE_DATAKEYFRAME &&
+       tvs->targetVariablesSize != msg->fieldCount) {
         UA_LOG_WARNING_PUBSUB(psm->logging, dsr,
                               "Number of fields does not match the "
                               "TargetVariables configuration");
@@ -652,10 +668,31 @@ UA_DataSetReader_process(UA_PubSubManager *psm, UA_DataSetReader *dsr,
     }
 
     /* Write the message fields. RT has the external data value configured. */
+    const UA_Boolean isDelta =
+        (msg->header.dataSetMessageType == UA_DATASETMESSAGE_DATADELTAFRAME);
     UA_StatusCode res = UA_STATUSCODE_GOOD;
     for(size_t i = 0; i < msg->fieldCount; i++) {
-        UA_FieldTargetDataType *tv = &tvs->targetVariables[i];
-        UA_DataValue *field = &msg->data.keyFrameFields[i];
+        UA_FieldTargetDataType *tv;
+        UA_DataValue *field;
+        if(isDelta) {
+            /* A DeltaFrame field names its own position in the full DataSet.
+             * The index comes off the wire, so it is bounds-checked against
+             * our configuration before it is used to subscript. */
+            UA_UInt16 idx = msg->data.deltaFrameFields[i].index;
+            if(idx >= tvs->targetVariablesSize) {
+                UA_LOG_WARNING_PUBSUB(psm->logging, dsr,
+                                      "DeltaFrame field index %u is out of range "
+                                      "for %u TargetVariables",
+                                      (unsigned)idx,
+                                      (unsigned)tvs->targetVariablesSize);
+                continue;
+            }
+            tv = &tvs->targetVariables[idx];
+            field = &msg->data.deltaFrameFields[i].value;
+        } else {
+            tv = &tvs->targetVariables[i];
+            field = &msg->data.keyFrameFields[i];
+        }
         if(!field->hasValue)
             continue;
 
@@ -669,7 +706,8 @@ UA_DataSetReader_process(UA_PubSubManager *psm, UA_DataSetReader *dsr,
         Operation_Write(psm->sc.server, &psm->sc.server->adminSession, &writeVal, &res);
         if(res != UA_STATUSCODE_GOOD)
             UA_LOG_INFO_PUBSUB(psm->logging, dsr,
-                               "Error writing KeyFrame field %u: %s",
+                               "Error writing %s field %u: %s",
+                               isDelta ? "DeltaFrame" : "KeyFrame",
                                (unsigned)i, UA_StatusCode_name(res));
     }
 }
