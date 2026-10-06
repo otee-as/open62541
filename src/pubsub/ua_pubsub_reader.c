@@ -454,6 +454,10 @@ UA_DataSetReaderConfig_clear(UA_DataSetReaderConfig *cfg) {
     }
 }
 
+static void
+UA_DataSetReader_handleMessageReceiveTimeout(UA_PubSubManager *psm,
+                                             UA_DataSetReader *dsr);
+
 UA_StatusCode
 UA_DataSetReader_setPubSubState(UA_PubSubManager *psm, UA_DataSetReader *dsr,
                                 UA_PubSubState targetState, UA_StatusCode errorReason) {
@@ -509,12 +513,30 @@ UA_DataSetReader_setPubSubState(UA_PubSubManager *psm, UA_DataSetReader *dsr,
         break;
     }
 
-    /* Only keep the timeout callback if the reader is operational */
-    if(dsr->head.state != UA_PUBSUBSTATE_OPERATIONAL &&
-       dsr->msgRcvTimeoutTimerId != 0) {
-        UA_EventLoop *el = psm->sc.server->config.eventLoop;
+    /* OTee: the MessageReceiveTimeout runs whenever the reader expects
+     * messages, from the moment it is enabled.
+     *
+     * Part 14 §6.2.9.6 makes MessageReceiveTimeout the longest acceptable gap
+     * before the reader goes to Error. Upstream arms the timer only in
+     * UA_DataSetReader_process(), so the gap before the first message is never
+     * timed: a reader enabled for a Publisher that never sends stays
+     * PreOperational -- or Operational, when it adopts the state of a
+     * ReaderGroup that has received before -- for ever. A Subscriber
+     * commissioned by a Controller that then dies reports a healthy connection
+     * over a dead one. */
+    UA_EventLoop *el = psm->sc.server->config.eventLoop;
+    const UA_Boolean expecting =
+        (dsr->head.state == UA_PUBSUBSTATE_OPERATIONAL ||
+         dsr->head.state == UA_PUBSUBSTATE_PREOPERATIONAL);
+    if(!expecting && dsr->msgRcvTimeoutTimerId != 0) {
         el->removeTimer(el, dsr->msgRcvTimeoutTimerId);
         dsr->msgRcvTimeoutTimerId = 0;
+    }
+    if(expecting && dsr->config.messageReceiveTimeout > 0.0 &&
+       dsr->msgRcvTimeoutTimerId == 0) {
+        el->addTimer(el, (UA_Callback)UA_DataSetReader_handleMessageReceiveTimeout,
+                     psm, dsr, dsr->config.messageReceiveTimeout, NULL,
+                     UA_TIMERPOLICY_CURRENTTIME, &dsr->msgRcvTimeoutTimerId);
     }
 
  finalize_state_machine:
@@ -592,6 +614,25 @@ UA_DataSetReader_process(UA_PubSubManager *psm, UA_DataSetReader *dsr,
      * Transition from PreOperational to Operational. */
     if(dsr->head.state == UA_PUBSUBSTATE_PREOPERATIONAL)
         UA_DataSetReader_setPubSubState(psm, dsr, dsr->head.state, UA_STATUSCODE_GOOD);
+
+    /* OTee: a message ends the MessageReceiveTimeout Error state.
+     *
+     * Part 14 §6.2.9.6 says the DataSetReader State "shall be changed to Error
+     * until the next DataSetMessage is received". Only the first half of that
+     * was implemented: handleMessageReceiveTimeout() sets Error, and the guard
+     * below then discards the very message that is supposed to end it. The
+     * condition is therefore circular — the only thing that can clear Error is
+     * a message, and no message is accepted while in Error — so a reader that
+     * times out once stays deaf until the application restarts it. A momentary
+     * gap, a Publisher restart or a switch reconverging becomes permanent.
+     *
+     * Targeting OPERATIONAL re-enters the Enabled branch of the state machine,
+     * which adopts the linked ReaderGroup's state rather than forcing one. The
+     * timeout callback was removed when the reader entered Error; the state
+     * change re-arms it, and the message below restarts it. */
+    if(dsr->head.state == UA_PUBSUBSTATE_ERROR)
+        UA_DataSetReader_setPubSubState(psm, dsr, UA_PUBSUBSTATE_OPERATIONAL,
+                                        UA_STATUSCODE_GOOD);
 
     if(dsr->head.state != UA_PUBSUBSTATE_OPERATIONAL &&
        dsr->head.state != UA_PUBSUBSTATE_PREOPERATIONAL) {
