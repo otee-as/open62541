@@ -453,9 +453,20 @@ UA_ReaderGroup_process(UA_PubSubManager *psm, UA_ReaderGroup *rg,
     UA_Boolean processed = false;
     UA_DataSetReader *reader, *reader_tmp;
     LIST_FOREACH_SAFE(reader, &rg->readers, listEntry, reader_tmp) {
-        /* Check if the reader is enabled */
+        /* Check if the reader is enabled.
+         *
+         * OTee: Error is included deliberately. Part 14 §6.2.9.6 puts a
+         * DataSetReader into Error when MessageReceiveTimeout elapses and
+         * keeps it there "until the next DataSetMessage is received" — so the
+         * next message has to reach the reader for it to recover. Skipping an
+         * Error reader here makes that impossible: the message that should end
+         * the timeout is dropped before UA_DataSetReader_process() ever sees
+         * it, and a reader that times out once stays deaf until the
+         * application restarts it. The identifier check below still applies,
+         * so only a message genuinely addressed to this reader revives it. */
         if(reader->head.state != UA_PUBSUBSTATE_OPERATIONAL &&
-           reader->head.state != UA_PUBSUBSTATE_PREOPERATIONAL)
+           reader->head.state != UA_PUBSUBSTATE_PREOPERATIONAL &&
+           reader->head.state != UA_PUBSUBSTATE_ERROR)
             continue;
 
         UA_StatusCode res = UA_DataSetReader_checkIdentifier(psm, reader, nm);
